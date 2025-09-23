@@ -9,9 +9,14 @@
 (define-constant ERR-INSUFFICIENT-FUNDS (err u105))
 (define-constant ERR-APPOINTMENT-EXPIRED (err u106))
 (define-constant ERR-INVALID-RATING (err u107))
+(define-constant ERR-RECORD-EXISTS (err u108))
+(define-constant ERR-ACCESS-DENIED (err u109))
+(define-constant ERR-ACCESS-EXPIRED (err u110))
+(define-constant ERR-INVALID-RECORD-TYPE (err u111))
 
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var next-appointment-id uint u1)
+(define-data-var next-record-id uint u1)
 
 (define-map doctors principal 
   {
@@ -45,6 +50,35 @@
 (define-map doctor-earnings principal uint)
 (define-map patient-payments principal uint)
 (define-map appointment-payments uint uint)
+
+(define-map medical-records uint
+  {
+    patient: principal,
+    record-type: (string-ascii 30),
+    ipfs-hash: (string-ascii 60),
+    created-at: uint,
+    is-active: bool,
+    description: (string-ascii 200)
+  })
+
+(define-map record-access-permissions {record-id: uint, doctor: principal}
+  {
+    granted-at: uint,
+    expires-at: uint,
+    granted-by: principal,
+    access-type: (string-ascii 20)
+  })
+
+(define-map record-audit-trail {record-id: uint, event-id: uint}
+  {
+    actor: principal,
+    action: (string-ascii 20),
+    timestamp: uint,
+    details: (optional (string-ascii 100))
+  })
+
+(define-map patient-record-counts principal uint)
+(define-map record-event-counts uint uint)
 
 (define-public (register-doctor (name (string-ascii 50)) (specialty (string-ascii 30)) (hourly-rate uint))
   (begin
@@ -124,6 +158,28 @@
     (try! (as-contract (stx-transfer? refund-amount tx-sender (get patient appointment-data))))
     (ok true)))
 
+(define-public (grant-consultation-access (appointment-id uint) (record-id uint))
+  (let (
+    (appointment-data (unwrap! (map-get? appointments appointment-id) ERR-NOT-FOUND))
+    (record-data (unwrap! (map-get? medical-records record-id) ERR-NOT-FOUND))
+    (access-blocks (* (get duration-hours appointment-data) u10))
+  )
+    (asserts! (is-eq tx-sender (get patient appointment-data)) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get patient record-data) tx-sender) ERR-UNAUTHORIZED)
+    (asserts! (or (is-eq (get status appointment-data) "scheduled") 
+                  (is-eq (get status appointment-data) "in-progress")) ERR-INVALID-STATUS)
+    
+    (map-set record-access-permissions {record-id: record-id, doctor: (get doctor appointment-data)} {
+      granted-at: stacks-block-height,
+      expires-at: (+ stacks-block-height access-blocks),
+      granted-by: tx-sender,
+      access-type: "consultation"
+    })
+    
+    (log-record-event record-id tx-sender "consultation-access" 
+      (some "Access granted for consultation"))
+    (ok true)))
+
 (define-public (start-consultation (appointment-id uint))
   (let ((appointment-data (unwrap! (map-get? appointments appointment-id) ERR-NOT-FOUND)))
     (asserts! (is-eq tx-sender (get doctor appointment-data)) ERR-UNAUTHORIZED)
@@ -189,6 +245,102 @@
     (try! (as-contract (stx-transfer? earnings tx-sender tx-sender)))
     (ok earnings)))
 
+(define-private (log-record-event (record-id uint) (actor principal) (action (string-ascii 20)) (details (optional (string-ascii 100))))
+  (let ((event-count (default-to u0 (map-get? record-event-counts record-id))))
+    (map-set record-audit-trail {record-id: record-id, event-id: (+ event-count u1)} {
+      actor: actor,
+      action: action,
+      timestamp: stacks-block-height,
+      details: details
+    })
+    (map-set record-event-counts record-id (+ event-count u1))
+    (+ event-count u1)))
+
+(define-public (add-medical-record (record-type (string-ascii 30)) (ipfs-hash (string-ascii 60)) (description (string-ascii 200)))
+  (let (
+    (record-id (var-get next-record-id))
+    (patient-data (unwrap! (map-get? patients tx-sender) ERR-NOT-FOUND))
+  )
+    (asserts! (get is-active patient-data) ERR-UNAUTHORIZED)
+    (asserts! (> (len record-type) u0) ERR-INVALID-RECORD-TYPE)
+    (asserts! (> (len ipfs-hash) u0) ERR-INVALID-AMOUNT)
+    
+    (map-set medical-records record-id {
+      patient: tx-sender,
+      record-type: record-type,
+      ipfs-hash: ipfs-hash,
+      created-at: stacks-block-height,
+      is-active: true,
+      description: description
+    })
+    
+    (map-set patient-record-counts tx-sender 
+      (+ (default-to u0 (map-get? patient-record-counts tx-sender)) u1))
+    
+    (log-record-event record-id tx-sender "created" (some "Record added to registry"))
+    (var-set next-record-id (+ record-id u1))
+    (ok record-id)))
+
+(define-public (grant-record-access (record-id uint) (doctor principal) (duration-blocks uint) (access-type (string-ascii 20)))
+  (let (
+    (record-data (unwrap! (map-get? medical-records record-id) ERR-NOT-FOUND))
+    (doctor-data (unwrap! (map-get? doctors doctor) ERR-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get patient record-data)) ERR-UNAUTHORIZED)
+    (asserts! (get is-active doctor-data) ERR-UNAUTHORIZED)
+    (asserts! (> duration-blocks u0) ERR-INVALID-AMOUNT)
+    
+    (map-set record-access-permissions {record-id: record-id, doctor: doctor} {
+      granted-at: stacks-block-height,
+      expires-at: (+ stacks-block-height duration-blocks),
+      granted-by: tx-sender,
+      access-type: access-type
+    })
+    
+    (log-record-event record-id tx-sender "access-granted" 
+      (some "Access granted to doctor"))
+    (ok true)))
+
+(define-public (revoke-record-access (record-id uint) (doctor principal))
+  (let (
+    (record-data (unwrap! (map-get? medical-records record-id) ERR-NOT-FOUND))
+    (access-data (unwrap! (map-get? record-access-permissions {record-id: record-id, doctor: doctor}) ERR-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender (get patient record-data)) ERR-UNAUTHORIZED)
+    
+    (map-delete record-access-permissions {record-id: record-id, doctor: doctor})
+    (log-record-event record-id tx-sender "access-revoked" 
+      (some "Access revoked from doctor"))
+    (ok true)))
+
+(define-public (deactivate-record (record-id uint))
+  (let ((record-data (unwrap! (map-get? medical-records record-id) ERR-NOT-FOUND)))
+    (asserts! (is-eq tx-sender (get patient record-data)) ERR-UNAUTHORIZED)
+    
+    (map-set medical-records record-id (merge record-data {is-active: false}))
+    (log-record-event record-id tx-sender "deactivated" (some "Record marked inactive"))
+    (ok true)))
+
+(define-public (access-medical-record (record-id uint))
+  (let (
+    (record-data (unwrap! (map-get? medical-records record-id) ERR-NOT-FOUND))
+    (access-data (map-get? record-access-permissions {record-id: record-id, doctor: tx-sender}))
+  )
+    (asserts! (get is-active record-data) ERR-UNAUTHORIZED)
+    
+    (if (is-eq tx-sender (get patient record-data))
+      (begin
+        (log-record-event record-id tx-sender "patient-accessed" (some "Patient viewed own record"))
+        (ok (get ipfs-hash record-data)))
+      (match access-data
+        permission 
+          (if (> (get expires-at permission) stacks-block-height)
+            (begin
+              (log-record-event record-id tx-sender "doctor-accessed" (some "Doctor viewed record during consultation"))
+              (ok (get ipfs-hash record-data)))
+            ERR-ACCESS-EXPIRED)
+        ERR-ACCESS-DENIED))))
+
 (define-public (set-platform-fee (new-fee uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR-UNAUTHORIZED)
@@ -232,3 +384,31 @@
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender)))
+
+(define-read-only (get-medical-record (record-id uint))
+  (map-get? medical-records record-id))
+
+(define-read-only (get-record-access-permission (record-id uint) (doctor principal))
+  (map-get? record-access-permissions {record-id: record-id, doctor: doctor}))
+
+(define-read-only (get-patient-record-count (patient principal))
+  (default-to u0 (map-get? patient-record-counts patient)))
+
+(define-read-only (get-next-record-id)
+  (var-get next-record-id))
+
+(define-read-only (has-active-record-access (record-id uint) (doctor principal))
+  (match (map-get? record-access-permissions {record-id: record-id, doctor: doctor})
+    access-data (> (get expires-at access-data) stacks-block-height)
+    false))
+
+(define-read-only (get-record-audit-event (record-id uint) (event-id uint))
+  (map-get? record-audit-trail {record-id: record-id, event-id: event-id}))
+
+(define-read-only (get-record-event-count (record-id uint))
+  (default-to u0 (map-get? record-event-counts record-id)))
+
+(define-read-only (is-record-owner (record-id uint) (user principal))
+  (match (map-get? medical-records record-id)
+    record-data (is-eq (get patient record-data) user)
+    false))
