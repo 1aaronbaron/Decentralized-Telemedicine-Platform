@@ -13,6 +13,13 @@
 (define-constant ERR-ACCESS-DENIED (err u109))
 (define-constant ERR-ACCESS-EXPIRED (err u110))
 (define-constant ERR-INVALID-RECORD-TYPE (err u111))
+(define-constant ERR-INVALID-EMERGENCY-TIER (err u301))
+(define-constant ERR-NO-AVAILABLE-DOCTOR (err u302))
+(define-constant ERR-REQUEST-EXPIRED (err u303))
+(define-constant ERR-REQUEST-NOT-FOUND (err u304))
+(define-constant ERR-NOT-REQUEST-PATIENT (err u305))
+(define-constant ERR-ALREADY-ACCEPTED (err u306))
+(define-constant ERR-NOT-MATCHED-DOCTOR (err u307))
 
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var next-appointment-id uint u1)
@@ -79,6 +86,25 @@
 
 (define-map patient-record-counts principal uint)
 (define-map record-event-counts uint uint)
+
+(define-map emergency-queue
+  { request-id: uint }
+  {
+    patient: principal,
+    specialty-required: (string-ascii 50),
+    emergency-tier: (string-ascii 10),
+    cost-multiplier: uint,
+    requested-at: uint,
+    status: (string-ascii 20),
+    matched-doctor: (optional principal)
+  })
+
+(define-map doctor-emergency-availability
+  { doctor: principal }
+  { available-for-emergency: bool })
+
+(define-data-var emergency-request-counter uint u0)
+(define-data-var emergency-acceptance-window uint u10)
 
 (define-public (register-doctor (name (string-ascii 50)) (specialty (string-ascii 30)) (hourly-rate uint))
   (begin
@@ -256,6 +282,23 @@
     (map-set record-event-counts record-id (+ event-count u1))
     (+ event-count u1)))
 
+(define-private (get-emergency-multiplier (tier (string-ascii 10)))
+  (if (is-eq tier "standard")
+    (ok u120)
+    (if (is-eq tier "urgent")
+      (ok u150)
+      (if (is-eq tier "critical")
+        (ok u200)
+        ERR-INVALID-EMERGENCY-TIER
+      )
+    )
+  )
+)
+
+(define-private (find-available-emergency-doctor (specialty (string-ascii 50)))
+  (ok none)
+)
+
 (define-public (add-medical-record (record-type (string-ascii 30)) (ipfs-hash (string-ascii 60)) (description (string-ascii 200)))
   (let (
     (record-id (var-get next-record-id))
@@ -348,6 +391,82 @@
     (var-set platform-fee-percentage new-fee)
     (ok true)))
 
+(define-public (request-emergency-consultation (specialty (string-ascii 50)) (tier (string-ascii 10)))
+  (let
+    (
+      (request-id (+ (var-get emergency-request-counter) u1))
+      (multiplier-result (get-emergency-multiplier tier))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-ok multiplier-result) multiplier-result)
+    (let
+      (
+        (cost-multiplier (unwrap-panic multiplier-result))
+      )
+      (map-set emergency-queue
+        { request-id: request-id }
+        {
+          patient: tx-sender,
+          specialty-required: specialty,
+          emergency-tier: tier,
+          cost-multiplier: cost-multiplier,
+          requested-at: current-block,
+          status: "pending",
+          matched-doctor: none
+        }
+      )
+      (var-set emergency-request-counter request-id)
+      (ok request-id)
+    )
+  )
+)
+
+(define-public (accept-emergency-request (request-id uint))
+  (let
+    (
+      (request (unwrap! (map-get? emergency-queue { request-id: request-id }) ERR-REQUEST-NOT-FOUND))
+      (current-block stacks-block-height)
+      (requested-at (get requested-at request))
+      (acceptance-window (var-get emergency-acceptance-window))
+    )
+    (asserts! (is-eq (get status request) "pending") ERR-ALREADY-ACCEPTED)
+    (asserts! (<= current-block (+ requested-at acceptance-window)) ERR-REQUEST-EXPIRED)
+    (map-set emergency-queue
+      { request-id: request-id }
+      (merge request {
+        status: "accepted",
+        matched-doctor: (some tx-sender)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (reject-emergency-request (request-id uint))
+  (let
+    (
+      (request (unwrap! (map-get? emergency-queue { request-id: request-id }) ERR-REQUEST-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get patient request)) ERR-NOT-REQUEST-PATIENT)
+    (asserts! (is-eq (get status request) "pending") ERR-ALREADY-ACCEPTED)
+    (map-set emergency-queue
+      { request-id: request-id }
+      (merge request { status: "rejected" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (toggle-emergency-availability (available bool))
+  (begin
+    (map-set doctor-emergency-availability
+      { doctor: tx-sender }
+      { available-for-emergency: available }
+    )
+    (ok true)
+  )
+)
+
 (define-read-only (get-doctor (doctor-address principal))
   (map-get? doctors doctor-address))
 
@@ -412,3 +531,33 @@
   (match (map-get? medical-records record-id)
     record-data (is-eq (get patient record-data) user)
     false))
+
+(define-read-only (get-emergency-request (request-id uint))
+  (map-get? emergency-queue { request-id: request-id })
+)
+
+(define-read-only (get-doctor-emergency-status (doctor principal))
+  (default-to
+    { available-for-emergency: false }
+    (map-get? doctor-emergency-availability { doctor: doctor })
+  )
+)
+
+(define-read-only (get-emergency-request-counter)
+  (var-get emergency-request-counter)
+)
+
+(define-read-only (is-request-expired (request-id uint))
+  (match (map-get? emergency-queue { request-id: request-id })
+    request
+      (let
+        (
+          (current-block stacks-block-height)
+          (requested-at (get requested-at request))
+          (acceptance-window (var-get emergency-acceptance-window))
+        )
+        (> current-block (+ requested-at acceptance-window))
+      )
+    false
+  )
+)
